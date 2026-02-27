@@ -1,0 +1,321 @@
+name: pr-assistant
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-assistant-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  assist:
+    # Only respond to PR comments (not issue comments) starting with @pr-assistant
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '@pr-assistant')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # --- Acknowledge ---------------------------------------------------
+      - name: Add eyes reaction to comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content='eyes'
+
+      # --- Environment setup ---------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout PR branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr checkout "${{ github.event.issue.number }}"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # --- Context gathering ---------------------------------------------
+      - name: Gather PR context
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          PR_NUMBER="${{ github.event.issue.number }}"
+
+          # Single API call for all scalar metadata
+          PR_META=$(gh pr view "$PR_NUMBER" --json title,headRefName,baseRefName)
+          PR_TITLE=$(echo "$PR_META" | jq -r '.title')
+          PR_BRANCH=$(echo "$PR_META" | jq -r '.headRefName')
+          PR_BASE=$(echo "$PR_META" | jq -r '.baseRefName')
+
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+          echo "pr_branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr_base=$PR_BASE" >> "$GITHUB_OUTPUT"
+
+          # Fetch all PR conversation comments
+          gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+            --jq '.[] | "**\(.user.login):** \(.body)\n"' \
+            > /tmp/pr-comments.txt 2>/dev/null \
+            || echo "(no comments)" > /tmp/pr-comments.txt
+
+          # Fetch diff; truncate to 100K chars if too large for the prompt
+          MAX_DIFF_CHARS=100000
+          gh pr diff "$PR_NUMBER" > /tmp/pr-diff-raw.txt
+
+          DIFF_SIZE=$(wc -c < /tmp/pr-diff-raw.txt)
+          if [ "$DIFF_SIZE" -gt "$MAX_DIFF_CHARS" ]; then
+            head -c "$MAX_DIFF_CHARS" /tmp/pr-diff-raw.txt > /tmp/pr-diff.txt
+            printf '\n\n[... diff truncated — showing first %s of %s characters ...]\n' \
+              "$MAX_DIFF_CHARS" "$DIFF_SIZE" >> /tmp/pr-diff.txt
+          else
+            cp /tmp/pr-diff-raw.txt /tmp/pr-diff.txt
+          fi
+
+          # Strip @pr-assistant prefix; use env var to prevent shell injection
+          USER_REQUEST="${COMMENT_BODY#@pr-assistant}"
+          USER_REQUEST=$(echo "$USER_REQUEST" | sed 's/^[[:space:]]*//')
+
+          # Extract --model override before writing the cleaned request.
+          # Supports both "--model value" and "--model=value" syntax.
+          MODEL_OVERRIDE=$(echo "$USER_REQUEST" | grep -oP -- '--model[= ]\s*\K[^\s]+' || true)
+
+          # Strip --model flag from request so downstream agents/classifiers see clean text
+          CLEAN_REQUEST=$(echo "$USER_REQUEST" | sed -E 's/--model[= ]\s*[^ ]+//g' | sed 's/^[[:space:]]*//')
+          printf '%s' "$CLEAN_REQUEST" > /tmp/user-request.txt
+
+          # Persist override for the resolve-model step
+          printf '%s' "$MODEL_OVERRIDE" > /tmp/model-override.txt
+
+      # --- Request classification ----------------------------------------
+      # Order matters: most specific pattern first to prevent misrouting.
+      # "code review fix" must match before bare "code review".
+      - name: Classify request
+        id: classify
+        run: |
+          REQUEST=$(tr '[:upper:]' '[:lower:]' < /tmp/user-request.txt)
+
+          if echo "$REQUEST" | grep -qE 'code[[:space:]]+review[[:space:]]+fix'; then
+            echo "agent_type=code-review-fix" >> "$GITHUB_OUTPUT"
+
+          elif echo "$REQUEST" | grep -qE '\b(code[[:space:]]+review|review|audit|check[[:space:]]+quality)\b'; then
+            echo "agent_type=code-review" >> "$GITHUB_OUTPUT"
+
+          elif echo "$REQUEST" | grep -qE '^[[:space:]]*change\b'; then
+            echo "agent_type=pr-change-agent" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "agent_type=default" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- Model resolution -----------------------------------------------
+      # Priority: comment --model flag > repo variable > hardcoded default
+      - name: Resolve model
+        id: model
+        env:
+          REPO_MODEL: ${{ vars.COPILOT_MODEL }}
+        run: |
+          MODEL_OVERRIDE=$(cat /tmp/model-override.txt 2>/dev/null || true)
+
+          if [ -n "$MODEL_OVERRIDE" ]; then
+            RESOLVED="$MODEL_OVERRIDE"
+            echo "::notice::Model override from comment: $RESOLVED"
+          elif [ -n "$REPO_MODEL" ]; then
+            RESOLVED="$REPO_MODEL"
+            echo "::notice::Model from repository variable: $RESOLVED"
+          else
+            RESOLVED="gpt-5.3-codex"
+            echo "::notice::Using default model: $RESOLVED"
+          fi
+
+          echo "model=$RESOLVED" >> "$GITHUB_OUTPUT"
+
+      # --- Prompt construction -------------------------------------------
+      - name: Build Copilot prompt
+        env:
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          PR_TITLE: ${{ steps.context.outputs.pr_title }}
+          PR_BRANCH: ${{ steps.context.outputs.pr_branch }}
+          PR_BASE: ${{ steps.context.outputs.pr_base }}
+          AGENT_TYPE: ${{ steps.classify.outputs.agent_type }}
+        run: |
+          {
+            # For default mode (general questions), prepend read-only instructions
+            if [ "$AGENT_TYPE" = "default" ]; then
+              cat << 'READ_ONLY_EOF'
+          ## Operating Mode: Read-Only Question Answering
+
+          You are a professional, constructive, and friendly PR assistant answering questions about this pull request.
+
+          ### STRICT CONSTRAINTS
+          - **DO NOT** modify any repository files. You are in read-only mode.
+          - **DO NOT** create branches, make commits, or push anything.
+          - **DO NOT** run `git checkout -b`, `git commit`, `git push`, or `gh pr create`.
+          - You MAY use `read`, `search`, and `execute` (for read-only commands like `git log`, `git diff`, `bun run check-types`) to gather information.
+          - You MAY use `edit` **only** to write temporary comment files to `/tmp/` for posting via `gh pr comment --body-file`. Do NOT use `edit` on any repository file.
+
+          ### Response Posting
+          You MUST post your response as PR comments. The workflow will NOT post for you.
+
+          **Two-step pattern (use this every time):**
+          1. Use the `edit` tool to write your markdown content to a file (e.g., `/tmp/response.md`). This bypasses shell interpretation entirely — backticks, dollar signs, and special characters are preserved exactly as written.
+          2. Use the `execute` tool to post it: `GH_TOKEN=$(cat /tmp/.gh-token) gh pr comment "$PR_NUMBER" --body-file /tmp/response.md`
+
+          **NEVER** use `--body "..."` with inline text. **NEVER** use shell heredocs (`cat << EOF`) to write comment files. Always write the file with the `edit` tool, then post with `execute`.
+
+          ### Authentication for `gh` Commands
+          The `execute` tool does **NOT** inherit environment variables. You **must** prefix every `gh` command with `GH_TOKEN` loaded from `/tmp/.gh-token`:
+          ```bash
+          GH_TOKEN=$(cat /tmp/.gh-token) gh pr comment ...
+          ```
+
+          Use unique filenames if posting multiple comments (e.g., `/tmp/response-1.md`, `/tmp/response-2.md`). You may post multiple comments to report progress.
+
+          ### Response Guidelines
+          - Base every claim on concrete evidence from the diff, commit history, or source files.
+          - Use GitHub-Flavored Markdown.
+          - Keep responses concise and focused on the question asked.
+          - If you cannot determine the answer from available evidence, say so clearly.
+          - Reference specific files, lines, or diff hunks to support your answer.
+          READ_ONLY_EOF
+              printf '\n\n'
+            fi
+
+            printf '## PR Context\n'
+            printf -- '- **PR Number:** #%s\n' "$PR_NUMBER"
+            printf -- '- **PR Title:** %s\n' "$PR_TITLE"
+            printf -- '- **PR Branch:** %s\n' "$PR_BRANCH"
+            printf -- '- **Base Branch:** %s\n\n' "$PR_BASE"
+
+            printf '## PR Comments (conversation so far)\n'
+            cat /tmp/pr-comments.txt
+            printf '\n\n'
+
+            printf '## User Request\n'
+            cat /tmp/user-request.txt
+            printf '\n\n'
+
+            printf '## PR Diff\n'
+            printf '```diff\n'
+            cat /tmp/pr-diff.txt
+            printf '\n```\n'
+          } > /tmp/copilot-prompt.txt
+
+      # --- Copilot CLI ---------------------------------------------------
+      - name: Install GitHub Copilot CLI
+        run: curl -fsSL https://gh.io/copilot-install | bash
+
+      # Persist auth token to a file so that nested copilot subagent
+      # invocations (via the execute tool) can read it back.
+      # The execute tool does NOT inherit environment variables from
+      # the parent process, so env-var-based auth fails for subagents.
+      - name: Persist tokens for agent subprocesses
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$COPILOT_GITHUB_TOKEN" > /tmp/.copilot-token
+          chmod 600 /tmp/.copilot-token
+          printf '%s' "$GH_TOKEN" > /tmp/.gh-token
+          chmod 600 /tmp/.gh-token
+
+      - name: Persist resolved model for subagents
+        run: printf '%s' "${{ steps.model.outputs.model }}" > /tmp/.copilot-model
+
+      # COPILOT_GITHUB_TOKEN -> highest-priority auth for the Copilot CLI
+      # GH_TOKEN -> default token so the agent's internal gh calls have repo permissions
+      # PR_NUMBER -> available to agents for posting comments
+      - name: Run Copilot CLI agent
+        id: copilot
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          COPILOT_MODEL: ${{ steps.model.outputs.model }}
+        run: |
+          PROMPT=$(cat /tmp/copilot-prompt.txt)
+          AGENT_TYPE="${{ steps.classify.outputs.agent_type }}"
+
+          if [ "$AGENT_TYPE" = "default" ]; then
+            # No --agent flag; read-only instructions are embedded in the prompt
+            copilot \
+              -p "$PROMPT" \
+              --model "$COPILOT_MODEL" \
+              --allow-all-tools \
+              -s \
+              > /tmp/copilot-response.txt \
+              2> /tmp/copilot-error.txt
+          else
+            # Use the classified agent
+            copilot \
+              -p "$PROMPT" \
+              --agent "$AGENT_TYPE" \
+              --model "$COPILOT_MODEL" \
+              --allow-all-tools \
+              -s \
+              > /tmp/copilot-response.txt \
+              2> /tmp/copilot-error.txt
+          fi
+
+      # --- Response posting ----------------------------------------------
+      # Only post response for code-review (workflow-managed posting).
+      # All other agent types (pr-change-agent, code-review-fix, default)
+      # post their own comments via gh CLI — no workflow-level posting needed.
+      - name: Post response comment (code-review only)
+        if: >-
+          steps.classify.outputs.agent_type == 'code-review' &&
+          steps.copilot.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -s /tmp/copilot-response.txt ]; then
+            gh pr comment "${{ github.event.issue.number }}" \
+              --body-file /tmp/copilot-response.txt
+          fi
+
+      # Error posting applies to ALL agent types
+      - name: Post error comment
+        if: steps.copilot.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo '> :warning: **PR Assistant** encountered an error while processing your request.'
+            echo ''
+            echo '<details>'
+            echo '<summary>Error details</summary>'
+            echo ''
+            echo '```'
+            cat /tmp/copilot-error.txt 2>/dev/null || echo 'No error output captured.'
+            echo '```'
+            echo ''
+            echo '</details>'
+            echo ''
+            printf 'Agent type: `%s`\n\n' "${{ steps.classify.outputs.agent_type }}"
+            printf 'Please try again or check the [workflow run](%s/%s/actions/runs/%s) for more details.\n' \
+              "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}"
+          } > /tmp/error-comment.md
+
+          gh pr comment "${{ github.event.issue.number }}" \
+            --body-file /tmp/error-comment.md
