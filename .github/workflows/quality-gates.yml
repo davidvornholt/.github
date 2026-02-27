@@ -1,6 +1,7 @@
 name: quality-gates
 
 on:
+  workflow_call:
   push:
     branches:
       - main
@@ -11,6 +12,7 @@ on:
 
 jobs:
   quality:
+    if: ${{ github.repository != 'davidvornholt/.github' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
